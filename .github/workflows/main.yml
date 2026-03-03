@@ -1,0 +1,88 @@
+name: Build Tailscale Android (Custom Patch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_ref:
+        description: 'tailscale-android 版本 (如 v1.78.0)'
+        required: true
+        default: 'main'
+      core_ref:
+        description: 'tailscale 核心库版本 (用于应用 Patch)'
+        required: true
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Android Wrapper
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale-android
+          ref: ${{ github.event.inputs.android_ref }}
+          path: tailscale-android
+
+      - name: Checkout Core Tailscale
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale
+          ref: ${{ github.event.inputs.core_ref }}
+          path: tailscale
+
+      - name: Checkout This Repo (For Patch)
+        uses: actions/checkout@v4
+        with:
+          path: my-assets
+
+      - name: Set up Go & Java
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Apply Patch to Core
+        run: |
+          cd tailscale
+          # 应用你的自定义补丁
+          patch -p1 < ../my-assets/force_standard_websocket.patch
+
+      - name: Configure Go Replace
+        run: |
+          cd tailscale-android
+          # 建立本地依赖关系，让 Android 壳使用你 Patch 后的 Go 核心 [cite: 17]
+          go mod edit -replace tailscale.com=../tailscale
+
+      - name: Prepare Signing Key
+        run: |
+          # 从 Secrets 还原 JKS 文件
+          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale-android/tailscale.jks
+
+      - name: Install Android SDK & NDK
+        run: |
+          cd tailscale-android
+          # 调用 Makefile 自动安装该版本要求的 SDK 组件 (如 NDK 23.1) [cite: 8, 27, 28]
+          make androidsdk 
+
+      - name: Build Release
+        env:
+          # 只有这两个是 Makefile 检查但没定义的 [cite: 3, 25]
+          JKS_PATH: ./tailscale.jks
+          JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
+        run: |
+          cd tailscale-android
+          # 1. 生成版本号 
+          make version
+          # 2. 编译并签名 (生成 .aab) 
+          make release
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-custom-apk
+          path: |
+            tailscale-android/*.aab
+            tailscale-android/android/build/outputs/apk/release/*.apk
