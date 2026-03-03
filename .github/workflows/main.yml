@@ -20,7 +20,7 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout Android Wrapper
+      - name: Check out code
         uses: actions/checkout@v4
         with:
           repository: tailscale/tailscale-android
@@ -38,72 +38,59 @@ jobs:
         with:
           path: my-assets
 
-      - name: Set up Environment (Go & Java)
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version-file: "go.mod"
           cache: true
-      - uses: actions/setup-java@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: "temurin"
+          java-version: "17"
           cache: 'gradle'
 
       - name: Cache Android SDK & NDK
-        id: cache-android
         uses: actions/cache@v4
         with:
           path: |
             ~/.android/
             ~/Android/Sdk
           key: ${{ runner.os }}-android-sdk-ndk-${{ github.event.inputs.android_ref }}
-          restore-keys: |
-            ${{ runner.os }}-android-sdk-ndk-
 
       - name: Apply Patch & Replace Logic
         run: |
-          #cd tailscale-core
-          #patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
-          #cd ..
-          #go mod edit -replace tailscale.com=./tailscale-core
-          #GOTOOLCHAIN=local go mod tidy
+          cd tailscale-core
+          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
+          cd ..
+          go mod edit -replace tailscale.com=./tailscale-core
+          GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare JKS
         run: |
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Full Build & Modern Sign Flow (apksigner)
+      - name: Full Build & apksigner
         env:
           JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
-          # 1. SDK 与 依赖编译
           make androidsdk
           make version gradle-dependencies build-unstripped-aar
           
-          # 2. 编译 Release APK
           cd android
-          chmod +x gradlew
           ./gradlew assembleRelease
           
-          # 3. 定位现代构建工具路径
-          # apksigner 和 zipalign 通常位于同一个 build-tools 目录下
           ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -V | tail -n 1)
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
-          
-          echo "Using Zipalign: $ZIPALIGN"
-          echo "Using Apksigner: $APKSIGNER"
 
-          # 4. 签名流程：先对齐，后签名 (V2/V3 规范)
           find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
             aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
             final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
             
-            echo "Step 1: Zipaligning $unsigned_apk..."
             $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
             
-            echo "Step 2: Signing with apksigner (V2+V3)..."
-            # apksigner 的参数格式与 jarsigner 不同
             $APKSIGNER sign --ks ../tailscale.jks \
               --ks-pass "pass:${JKS_PASSWORD}" \
               --ks-key-alias tailscale \
@@ -111,10 +98,7 @@ jobs:
               --out "$final_apk" \
               "$aligned_apk"
             
-            # 5. 验证签名（V2 签名必须在此校验）
-            echo "Verifying signature..."
             $APKSIGNER verify -v "$final_apk"
-            
             rm "$unsigned_apk" "$aligned_apk"
           done
 
@@ -124,9 +108,7 @@ jobs:
           tag_name: ${{ github.event.inputs.android_ref }}-${{ github.run_number }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
-            Tailscale Android 补丁版。
-            - 签名方案: `apksigner` (V2/V3)
-            - 签名别名: `tailscale`
+            已修复干扰字符并使用 apksigner 签名。
           files: |
             android/build/outputs/apk/release/*.apk
         env:
