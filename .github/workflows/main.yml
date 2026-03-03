@@ -10,7 +10,7 @@ on:
       core_ref:
         description: 'tailscale 核心库版本 (Tag 或 Branch)'
         required: true
-        default: 'main'
+        default: 'v1.94.2'
 
 jobs:
   build:
