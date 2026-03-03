@@ -49,6 +49,93 @@ jobs:
 
       - name: Apply Patch & Replace Logic
         run: |
+          # 进入核心库打补丁
+          cd tailscale
+          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
+          cd ..
+          # 替换依赖为本地补丁版本
+          go mod edit -replace tailscale.com=./tailscale
+          GOTOOLCHAIN=local go mod tidy
+
+      - name: Prepare JKS
+        run: |
+          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
+
+      - name: Full Build & Sign Flow
+        env:
+          JKS_PATH: ${{ github.workspace }}/tailscale.jks
+          JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
+        run: |
+          # 1. 准备 Android SDK 环境 (复刻 Makefile Line 36)
+          make androidsdk
+          
+          # 2. 生成版本信息与编译 AAR (复刻 Makefile Line 106 & 112)
+          # 注意：build-unstripped-aar 会处理 Makefile 中的 16KB 页对齐参数
+          make version gradle-dependencies build-unstripped-aar
+          
+          # 3. 编译生成的 Release APK
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+          
+          # 4. 获取签名别名与工具路径
+          # 自动获取 JKS 里的第一个 Alias
+          ALIAS=$(keytool -list -v -keystore ../tailscale.jks -storepass ${{ env.JKS_PASSWORD }} | grep "Alias name:" | head -n 1 | cut -d' ' -f3)
+          # 寻找 SDK 中最新的 zipalign
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -r | head -n 1)
+          
+          echo "Using Alias: $ALIAS"
+          echo "Using Zipalign: $ZIPALIGN"
+
+          # 5. 执行：先对齐，后签名 (V1 签名标准流程)
+          find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
+            aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
+            final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
+            
+            echo "Step A: Aligning $unsigned_apk..."
+            $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
+            
+            echo "Step B: Signing $aligned_apk..."
+            jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
+              -keystore ${{ env.JKS_PATH }} \
+              -storepass ${{ env.JKS_PASSWORD }} \
+              -keypass ${{ env.JKS_PASSWORD }} \
+              -signedjar "$final_apk" \
+              "$aligned_apk" \
+              "$ALIAS"
+            
+            # 清理中间文件，只留最终签好名的 APK
+            rm "$unsigned_apk" "$aligned_apk"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.android_ref }}
+          name: Tailscale Android ${{ github.event.inputs.android_ref }}
+          body: |
+            Tailscale Android 补丁版编译成功。
+            - Android Wrapper: `${{ github.event.inputs.android_ref }}`
+            - Core Tailscale: `${{ github.event.inputs.core_ref }}`
+            - WebSocket Patch: Applied
+          files: |
+            android/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}        uses: actions/checkout@v4
+        with:
+          path: my-assets
+
+      - name: Set up Environment (Go & Java)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Apply Patch & Replace Logic
+        run: |
           # 打补丁并执行 Go 模块替换
           cd tailscale
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
