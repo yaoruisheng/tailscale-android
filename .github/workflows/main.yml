@@ -42,14 +42,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
-          cache: true # 自动开启 Go 缓存
+          cache: true
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'gradle' # 自动开启 Gradle 缓存
+          cache: 'gradle'
 
-      # --- 新增：Android SDK & NDK 缓存 ---
       - name: Cache Android SDK & NDK
         id: cache-android
         uses: actions/cache@v4
@@ -73,44 +72,48 @@ jobs:
         run: |
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Full Build & Sign Flow (Strict Makefile Logic)
+      - name: Full Build & Modern Sign Flow (apksigner)
         env:
           JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
-          # 1. 如果缓存未命中，则执行 Makefile 中的 SDK 下载
-          # make androidsdk 内部会检查目录，由于我们配置了缓存恢复，这里速度会极快
+          # 1. SDK 与 依赖编译
           make androidsdk
-          
-          # 2. 编译 AAR 依赖
           make version gradle-dependencies build-unstripped-aar
           
-          # 3. 编译 Release APK
+          # 2. 编译 Release APK
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease
           
-          # 4. 签名流程
-          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -r | head -n 1)
+          # 3. 定位现代构建工具路径
+          # apksigner 和 zipalign 通常位于同一个 build-tools 目录下
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -V | tail -n 1)
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
           
+          echo "Using Zipalign: $ZIPALIGN"
+          echo "Using Apksigner: $APKSIGNER"
+
+          # 4. 签名流程：先对齐，后签名 (V2/V3 规范)
           find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
             aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
             final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
             
-            echo "Aligning $unsigned_apk..."
+            echo "Step 1: Zipaligning $unsigned_apk..."
             $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
             
-            echo "Signing with Alias: tailscale"
-            jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
-              -keystore ../tailscale.jks \
-              -storepass "${JKS_PASSWORD}" \
-              -keypass "${JKS_PASSWORD}" \
-              -signedjar "$final_apk" \
-              "$aligned_apk" \
-              tailscale
+            echo "Step 2: Signing with apksigner (V2+V3)..."
+            # apksigner 的参数格式与 jarsigner 不同
+            $APKSIGNER sign --ks ../tailscale.jks \
+              --ks-pass "pass:${JKS_PASSWORD}" \
+              --ks-key-alias tailscale \
+              --key-pass "pass:${JKS_PASSWORD}" \
+              --out "$final_apk" \
+              "$aligned_apk"
             
-            # 校验签名
-            jarsigner -verify -verbose -certs "$final_apk"
+            # 5. 验证签名（V2 签名必须在此校验）
+            echo "Verifying signature..."
+            $APKSIGNER verify -v "$final_apk"
             
             rm "$unsigned_apk" "$aligned_apk"
           done
@@ -122,7 +125,7 @@ jobs:
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
             Tailscale Android 补丁版。
-            - 已启用缓存加速 (Go, Gradle, Android SDK)
+            - 签名方案: `apksigner` (V2/V3)
             - 签名别名: `tailscale`
           files: |
             android/build/outputs/apk/release/*.apk
