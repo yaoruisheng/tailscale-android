@@ -42,73 +42,76 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache: true # 自动开启 Go 缓存
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: 'gradle' # 自动开启 Gradle 缓存
+
+      # --- 新增：Android SDK & NDK 缓存 ---
+      - name: Cache Android SDK & NDK
+        id: cache-android
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/
+            ~/Android/Sdk
+          key: ${{ runner.os }}-android-sdk-ndk-${{ github.event.inputs.android_ref }}
+          restore-keys: |
+            ${{ runner.os }}-android-sdk-ndk-
 
       - name: Apply Patch & Replace Logic
         run: |
-          # 1. 核心库打补丁
           cd tailscale-core
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
           cd ..
-          # 2. 修改 go.mod 将远程依赖替换为本地打过补丁的路径
           go mod edit -replace tailscale.com=./tailscale-core
           GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare JKS
         run: |
-          # 将 base64 密钥还原为物理文件
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Full Build & Sign Flow (Makefile Strict)
+      - name: Full Build & Sign Flow (Strict Makefile Logic)
         env:
           JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
-          # A. 执行 Makefile 中的 SDK 下载 (Line 230)
+          # 1. 如果缓存未命中，则执行 Makefile 中的 SDK 下载
+          # make androidsdk 内部会检查目录，由于我们配置了缓存恢复，这里速度会极快
           make androidsdk
           
-          # B. 执行编译 AAR 依赖 (Line 106 & 112)
-          # 这一步会处理 Makefile 中定义的 16KB 页对齐等底层 LDFLAGS
+          # 2. 编译 AAR 依赖
           make version gradle-dependencies build-unstripped-aar
           
-          # C. 调用 Gradle 编译生成的 APK
+          # 3. 编译 Release APK
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease
           
-          # D. 自动化签名逻辑 (复刻 Makefile Line 128)
-          # 获取 JKS 里的 Alias（别名），防止硬编码 'tailscale' 导致签名损坏
-          ALIAS=$(keytool -list -v -keystore ../tailscale.jks -storepass "${JKS_PASSWORD}" | grep "Alias name:" | head -n 1 | cut -d' ' -f3)
-          # 寻找构建工具中的 zipalign
+          # 4. 签名流程
           ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -r | head -n 1)
           
-          echo "Using Alias: $ALIAS"
-          echo "Using Zipalign: $ZIPALIGN"
-
-          
-
           find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
             aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
             final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
             
-            # 1. 先对齐 (V1 签名必须在对齐之后)
             echo "Aligning $unsigned_apk..."
             $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
             
-            # 2. 签名 (严格复刻 Makefile 第 128 行参数)
-            echo "Signing with jarsigner..."
+            echo "Signing with Alias: tailscale"
             jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
               -keystore ../tailscale.jks \
               -storepass "${JKS_PASSWORD}" \
               -keypass "${JKS_PASSWORD}" \
               -signedjar "$final_apk" \
               "$aligned_apk" \
-              "$ALIAS"
+              tailscale
             
-            # 清理中间文件
+            # 校验签名
+            jarsigner -verify -verbose -certs "$final_apk"
+            
             rm "$unsigned_apk" "$aligned_apk"
           done
 
@@ -118,9 +121,9 @@ jobs:
           tag_name: ${{ github.event.inputs.android_ref }}-${{ github.run_number }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
-            Tailscale Android 补丁版编译成功。
-            - 核心库路径替换: `tailscale.com -> ./tailscale-core`
-            - WebSocket 补丁: 已应用
+            Tailscale Android 补丁版。
+            - 已启用缓存加速 (Go, Gradle, Android SDK)
+            - 签名别名: `tailscale`
           files: |
             android/build/outputs/apk/release/*.apk
         env:
