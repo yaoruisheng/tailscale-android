@@ -62,11 +62,11 @@ jobs:
 
       - name: Apply Patch & Replace Logic
         run: |
-          cd tailscale-core
-          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
-          cd ..
-          go mod edit -replace tailscale.com=./tailscale-core
-          GOTOOLCHAIN=local go mod tidy
+          #cd tailscale-core
+          #patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
+          #cd ..
+          #go mod edit -replace tailscale.com=./tailscale-core
+          #GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare JKS
         run: |
