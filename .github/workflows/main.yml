@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       android_ref:
-        description: 'tailscale-android 版本 (来自 Tags 页面)'
+        description: 'tailscale-android 版本'
         required: true
         default: '1.94.2-t0a29cf18b-g1a1b1c9ae'
       core_ref:
-        description: 'tailscale 核心库版本 (Tag 或 Branch)'
+        description: 'tailscale 核心库版本'
         required: true
         default: 'v1.94.2'
 
@@ -25,7 +25,6 @@ jobs:
         with:
           repository: tailscale/tailscale-android
           ref: ${{ github.event.inputs.android_ref }}
-          path: tailscale-android
 
       - name: Checkout Core Tailscale
         uses: actions/checkout@v4
@@ -48,33 +47,34 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Apply Patch to Core
+      - name: Apply Patch & Replace
         run: |
+          # 给核心库打补丁
           cd tailscale
-          # 使用详细模式并忽略空白符差异
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
-
-      - name: Configure Go Replace & Tidy
-        run: |
-          cd tailscale-android
-          go mod edit -replace tailscale.com=../tailscale
-          # 锁定本地工具链进行依赖同步
+          # 配置本地替换
+          cd ..
+          go mod edit -replace tailscale.com=./tailscale
           GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare JKS
         run: |
-          # 确保环境变量 JKS_BASE64 已在环境设置中
-          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale-android/tailscale.jks
+          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Build APK
+      - name: Build with Makefile
         env:
-          JKS_PATH: ./tailscale.jks
+          # 使用绝对路径，确保在任何目录下执行都能找到 JKS
+          JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
-          cd tailscale-android
-          # 自动准备 Makefile 指定的 SDK/NDK 环境
+          # 1. 调用 Makefile 自动下载并配置 NDK 23/SDK 34 (最省心)
           make androidsdk
-          # 编译可安装的 APK
+          
+          # 2. 调用 Makefile 生成版本文件并编译 Go 核心库 (.aar)
+          # 这会自动处理 tailscale.version 和 gradle-dependencies
+          make version gradle-dependencies
+          
+          # 3. 进入安卓目录完成最后的打包
           cd android
           ./gradlew assembleRelease
 
@@ -83,10 +83,8 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.android_ref }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
-          body: "Custom build with patched tailscale core."
-          draft: false
-          prerelease: false
+          body: "基于官方版本 ${{ github.event.inputs.android_ref }} 的自定义编译版。"
           files: |
-            tailscale-android/android/build/outputs/apk/release/*.apk
+            android/build/outputs/apk/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
