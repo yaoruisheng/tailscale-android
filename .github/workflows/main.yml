@@ -41,7 +41,7 @@ jobs:
       - name: Set up Environment (Go & Java)
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24' # 匹配 Makefile 要求的 Go 版本环境
+          go-version: 'stable'
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
