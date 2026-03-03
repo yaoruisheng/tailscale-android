@@ -75,6 +75,7 @@ jobs:
           # 自动准备 Makefile 指定的 SDK/NDK 环境
           make androidsdk
           # 编译可安装的 APK
+          cd android
           ./gradlew assembleRelease
 
       - name: Create GitHub Release
