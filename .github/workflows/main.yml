@@ -15,6 +15,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: JKS_BASE64
     steps:
       - name: Checkout Android Wrapper
         uses: actions/checkout@v4
