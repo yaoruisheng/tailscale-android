@@ -48,13 +48,14 @@ jobs:
         run: |
           cd tailscale
           # 应用你的自定义补丁
-          patch -p1 < ../my-assets/patches/force_standard_websocket.patch
+          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
 
       - name: Configure Go Replace
         run: |
           cd tailscale-android
           # 建立本地依赖关系，让 Android 壳使用你 Patch 后的 Go 核心 [cite: 17]
           go mod edit -replace tailscale.com=../tailscale
+          GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare Signing Key
         run: |
