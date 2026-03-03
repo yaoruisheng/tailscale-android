@@ -31,7 +31,7 @@ jobs:
         with:
           repository: tailscale/tailscale
           ref: ${{ github.event.inputs.core_ref }}
-          path: tailscale
+          path: tailscale-core
 
       - name: Checkout My Assets
         uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
       - name: Set up Environment (Go & Java)
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.24' # 匹配 Makefile 要求的 Go 版本环境
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
@@ -49,142 +49,79 @@ jobs:
 
       - name: Apply Patch & Replace Logic
         run: |
-          # 进入核心库打补丁
-          cd tailscale
+          # 1. 核心库打补丁
+          cd tailscale-core
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
           cd ..
-          # 替换依赖为本地补丁版本
-          go mod edit -replace tailscale.com=./tailscale
+          # 2. 修改 go.mod 将远程依赖替换为本地打过补丁的路径
+          go mod edit -replace tailscale.com=./tailscale-core
           GOTOOLCHAIN=local go mod tidy
 
       - name: Prepare JKS
         run: |
+          # 将 base64 密钥还原为物理文件
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Full Build & Sign Flow
+      - name: Full Build & Sign Flow (Makefile Strict)
         env:
           JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
-          # 1. 准备 Android SDK 环境 (复刻 Makefile Line 36)
+          # A. 执行 Makefile 中的 SDK 下载 (Line 230)
           make androidsdk
           
-          # 2. 生成版本信息与编译 AAR (复刻 Makefile Line 106 & 112)
-          # 注意：build-unstripped-aar 会处理 Makefile 中的 16KB 页对齐参数
+          # B. 执行编译 AAR 依赖 (Line 106 & 112)
+          # 这一步会处理 Makefile 中定义的 16KB 页对齐等底层 LDFLAGS
           make version gradle-dependencies build-unstripped-aar
           
-          # 3. 编译生成的 Release APK
+          # C. 调用 Gradle 编译生成的 APK
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease
           
-          # 4. 获取签名别名与工具路径
-          # 自动获取 JKS 里的第一个 Alias
-          ALIAS=$(keytool -list -v -keystore ../tailscale.jks -storepass ${{ env.JKS_PASSWORD }} | grep "Alias name:" | head -n 1 | cut -d' ' -f3)
-          # 寻找 SDK 中最新的 zipalign
+          # D. 自动化签名逻辑 (复刻 Makefile Line 128)
+          # 获取 JKS 里的 Alias（别名），防止硬编码 'tailscale' 导致签名损坏
+          ALIAS=$(keytool -list -v -keystore ../tailscale.jks -storepass "${JKS_PASSWORD}" | grep "Alias name:" | head -n 1 | cut -d' ' -f3)
+          # 寻找构建工具中的 zipalign
           ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -r | head -n 1)
           
           echo "Using Alias: $ALIAS"
           echo "Using Zipalign: $ZIPALIGN"
 
-          # 5. 执行：先对齐，后签名 (V1 签名标准流程)
+          
+
           find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
             aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
             final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
             
-            echo "Step A: Aligning $unsigned_apk..."
+            # 1. 先对齐 (V1 签名必须在对齐之后)
+            echo "Aligning $unsigned_apk..."
             $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
             
-            echo "Step B: Signing $aligned_apk..."
-            jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
-              -keystore ${{ env.JKS_PATH }} \
-              -storepass ${{ env.JKS_PASSWORD }} \
-              -keypass ${{ env.JKS_PASSWORD }} \
+            # 2. 签名 (严格复刻 Makefile 第 128 行参数)
+            echo "Signing with jarsigner..."
+            jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+              -keystore ../tailscale.jks \
+              -storepass "${JKS_PASSWORD}" \
+              -keypass "${JKS_PASSWORD}" \
               -signedjar "$final_apk" \
               "$aligned_apk" \
               "$ALIAS"
             
-            # 清理中间文件，只留最终签好名的 APK
+            # 清理中间文件
             rm "$unsigned_apk" "$aligned_apk"
           done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.android_ref }}
+          tag_name: ${{ github.event.inputs.android_ref }}-${{ github.run_number }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
             Tailscale Android 补丁版编译成功。
-            - Android Wrapper: `${{ github.event.inputs.android_ref }}`
-            - Core Tailscale: `${{ github.event.inputs.core_ref }}`
-            - WebSocket Patch: Applied
+            - 核心库路径替换: `tailscale.com -> ./tailscale-core`
+            - WebSocket 补丁: 已应用
           files: |
             android/build/outputs/apk/release/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}        uses: actions/checkout@v4
-        with:
-          path: my-assets
-
-      - name: Set up Environment (Go & Java)
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Apply Patch & Replace Logic
-        run: |
-          # 打补丁并执行 Go 模块替换
-          cd tailscale
-          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
-          cd ..
-          go mod edit -replace tailscale.com=./tailscale
-          GOTOOLCHAIN=local go mod tidy
-
-      - name: Prepare JKS
-        run: |
-          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
-
-      - name: Full Build Flow (Strict Makefile Logic)
-        env:
-          JKS_PATH: ${{ github.workspace }}/tailscale.jks
-          JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
-        run: |
-          # 1. 下载 Makefile 定义的 SDK/NDK (Line 36)
-          make androidsdk
-          
-          # 2. 生成版本号与编译 AAR (Line 106 & 112)
-          make version gradle-dependencies
-          
-          # 3. 编译生成的 APK (进入 android 目录)
-          cd android
-          ./gradlew assembleRelease
-          
-          # 4. 手动签名 (复刻 Makefile Line 128 的 jarsigner 逻辑)
-          # 寻找生成的 unsigned apk 并使用 jarsigner 进行 SHA256 签名
-          find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
-            signed_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
-            echo "Signing: $unsigned_apk -> $signed_apk"
-            jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
-              -keystore ${{ env.JKS_PATH }} \
-              -storepass ${{ env.JKS_PASSWORD }} \
-              -keypass ${{ env.JKS_PASSWORD }} \
-              -signedjar "$signed_apk" \
-              "$unsigned_apk" \
-              tailscale
-          done
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.android_ref }}
-          name: Tailscale Android ${{ github.event.inputs.android_ref }}
-          body: "补丁版编译成功。核心版本: ${{ github.event.inputs.core_ref }}"
-          # 仅上传签过名的 APK，排除 unsigned
-          files: |
-            android/build/outputs/apk/release/*.apk
-            !android/build/outputs/apk/release/*-unsigned.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
