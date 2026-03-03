@@ -1,21 +1,24 @@
-name: Build Tailscale Android (Custom Patch)
+name: Build and Release Tailscale APK
 
 on:
   workflow_dispatch:
     inputs:
       android_ref:
-        description: 'tailscale-android 版本 (如 v1.78.0)'
+        description: 'tailscale-android 版本 (来自 Tags 页面)'
         required: true
-        default: 'main'
+        default: '1.94.2-t0a29cf18b-g1a1b1c9ae'
       core_ref:
-        description: 'tailscale 核心库版本 (用于应用 Patch)'
+        description: 'tailscale 核心库版本 (Tag 或 Branch)'
         required: true
         default: 'main'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: JKS_BASE64
+    environment: Actions
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout Android Wrapper
         uses: actions/checkout@v4
@@ -31,7 +34,7 @@ jobs:
           ref: ${{ github.event.inputs.core_ref }}
           path: tailscale
 
-      - name: Checkout This Repo (For Patch)
+      - name: Checkout My Assets
         uses: actions/checkout@v4
         with:
           path: my-assets
@@ -48,43 +51,41 @@ jobs:
       - name: Apply Patch to Core
         run: |
           cd tailscale
-          # 应用你的自定义补丁
+          # 使用详细模式并忽略空白符差异
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
 
-      - name: Configure Go Replace
+      - name: Configure Go Replace & Tidy
         run: |
           cd tailscale-android
-          # 建立本地依赖关系，让 Android 壳使用你 Patch 后的 Go 核心 [cite: 17]
           go mod edit -replace tailscale.com=../tailscale
+          # 锁定本地工具链进行依赖同步
           GOTOOLCHAIN=local go mod tidy
 
-      - name: Prepare Signing Key
+      - name: Prepare JKS
         run: |
-          # 从 Secrets 还原 JKS 文件
+          # 确保环境变量 JKS_BASE64 已在环境设置中
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale-android/tailscale.jks
 
-      - name: Install Android SDK & NDK
-        run: |
-          cd tailscale-android
-          # 调用 Makefile 自动安装该版本要求的 SDK 组件 (如 NDK 23.1) [cite: 8, 27, 28]
-          make androidsdk 
-
-      - name: Build Release
+      - name: Build APK
         env:
-          # 只有这两个是 Makefile 检查但没定义的 [cite: 3, 25]
           JKS_PATH: ./tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
           cd tailscale-android
-          # 1. 生成版本号 
-          make version
-          # 2. 编译并签名 (生成 .aab) 
-          make release
+          # 自动准备 Makefile 指定的 SDK/NDK 环境
+          make androidsdk
+          # 编译可安装的 APK
+          ./gradlew assembleRelease
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: tailscale-custom-apk
-          path: |
-            tailscale-android/*.aab
+          tag_name: ${{ github.event.inputs.android_ref }}
+          name: Tailscale Android ${{ github.event.inputs.android_ref }}
+          body: "Custom build with patched tailscale core."
+          draft: false
+          prerelease: false
+          files: |
             tailscale-android/android/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
