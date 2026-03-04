@@ -1,0 +1,76 @@
+diff --git a/Makefile b/Makefile
+index b7e969a..113b1e4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,6 +14,7 @@ DOCKER_IMAGE := tailscale-android-build-amd64-041425-1
+ export TS_USE_TOOLCHAIN=1
+ 
+ DEBUG_APK := tailscale-debug.apk
++RELEASE_APK := tailscale-release.apk
+ RELEASE_AAB := tailscale-release.aab
+ RELEASE_TV_AAB := tailscale-tv-release.aab
+ 
+@@ -125,13 +126,22 @@ $(DEBUG_APK): libtailscale debug-symbols version gradle-dependencies build-unstr
+ 
+ # Builds the release AAB and signs it (phone/tablet/chromeOS variant)
+ .PHONY: release
+-release: jarsign-env $(RELEASE_AAB)
+-	@jarsigner -sigalg SHA256withRSA -digestalg SHA-256 -keystore $(JKS_PATH) -storepass $(JKS_PASSWORD) $(RELEASE_AAB) tailscale
++release: $(RELEASE_AAB)
++	@echo "Release AAB built and signed by Gradle: $(RELEASE_AAB)"
+ 
+ # Builds the release AAB and signs it (androidTV variant)
+ .PHONY: release-tv
+-release-tv: jarsign-env $(RELEASE_TV_AAB)
+-	@jarsigner -sigalg SHA256withRSA -digestalg SHA-256 -keystore $(JKS_PATH) -storepass $(JKS_PASSWORD) $(RELEASE_TV_AAB) tailscale
++release-tv: $(RELEASE_TV_AAB)
++	@echo "TV Release AAB built and signed by Gradle: $(RELEASE_TV_AAB)"
++
++.PHONY: release-apk
++release-apk: $(RELEASE_APK)
++	@echo "Release APK built and signed by Gradle: $(RELEASE_APK)"
++
++$(RELEASE_APK): version gradle-dependencies
++	@echo "Building release APK (signed via Gradle)"
++	(cd android && ./gradlew test assembleRelease)
++	install -C ./android/build/outputs/apk/release/android-release.apk $@
+ 
+ # gradle-dependencies groups together the android sources and libtailscale needed to assemble tests/debug/release builds.
+ .PHONY: gradle-dependencies
+@@ -355,7 +365,7 @@ docker-build-image: ## Builds the docker image for the android build environment
+ 	fi
+ 
+ .PHONY: docker-run-build
+-docker-run-build: clean jarsign-env docker-build-image ## Runs the docker image for the android build environment and builds release
++docker-run-build: clean docker-build-image ## Runs the docker image for the android build environment and builds release
+ 	@docker run --rm -v $(CURDIR):/build/tailscale-android --env JKS_PASSWORD=$(JKS_PASSWORD) --env JKS_PATH=$(JKS_PATH) $(DOCKER_IMAGE)
+ 
+ .PHONY: docker-remove-build-image
+diff --git a/android/build.gradle b/android/build.gradle
+index 8f64b3d..27f259c 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -73,6 +73,14 @@ android {
+     composeOptions {
+         kotlinCompilerExtensionVersion = "$compose_version"
+     }
++    signingConfigs {
++        release {
++            storeFile file(System.getenv("JKS_PATH") ?: "debug.keystore")
++            storePassword System.getenv("JKS_PASSWORD") ?: ""
++            keyAlias "tailscale"
++            keyPassword System.getenv("JKS_PASSWORD") ?: ""
++        }
++    }
+     flavorDimensions "version"
+     namespace 'com.tailscale.ipn'
+ 
+@@ -88,6 +96,8 @@ android {
+             manifestPlaceholders.leanbackRequired = false
+         }
+         release {
++            signingConfig signingConfigs.release
++
+             manifestPlaceholders.leanbackRequired = false
+ 
+             minifyEnabled true
