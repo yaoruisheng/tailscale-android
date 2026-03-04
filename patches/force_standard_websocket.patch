@@ -1,16 +1,19 @@
 diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
-index 06a2131fd..4d1d0c261 100644
+index 06a2131fd..822a65783 100644
 --- a/control/controlhttp/client.go
 +++ b/control/controlhttp/client.go
-@@ -36,6 +36,7 @@
+@@ -34,8 +34,10 @@
+ 	"net/url"
+ 	"runtime"
  	"sync/atomic"
++	"math/rand"
  	"time"
  
 +	"github.com/coder/websocket"
  	"tailscale.com/control/controlbase"
  	"tailscale.com/control/controlhttp/controlhttpcommon"
  	"tailscale.com/envknob"
-@@ -48,6 +49,7 @@
+@@ -48,6 +50,7 @@
  	"tailscale.com/net/netx"
  	"tailscale.com/net/sockstats"
  	"tailscale.com/net/tlsdial"
@@ -18,7 +21,7 @@ index 06a2131fd..4d1d0c261 100644
  	"tailscale.com/syncs"
  	"tailscale.com/tailcfg"
  	"tailscale.com/tstime"
-@@ -55,6 +57,175 @@
+@@ -55,6 +58,184 @@
  
  var stdDialer net.Dialer
  
@@ -28,6 +31,7 @@ index 06a2131fd..4d1d0c261 100644
 +type safeNetConn struct {
 +	net.Conn
 +	closed atomic.Bool
++	logf   func(string, ...any)
 +}
 +
 +func (c *safeNetConn) markClosed() {
@@ -40,6 +44,9 @@ index 06a2131fd..4d1d0c261 100644
 +	}
 +	defer func() {
 +		if r := recover(); r != nil {
++			if c.logf != nil {
++				c.logf("[safeNetConn] panic in Read: %v", r)
++			}
 +			err = io.ErrUnexpectedEOF
 +		}
 +	}()
@@ -52,32 +59,41 @@ index 06a2131fd..4d1d0c261 100644
 +	}
 +	defer func() {
 +		if r := recover(); r != nil {
++			if c.logf != nil {
++				c.logf("[safeNetConn] panic in Write: %v", r)
++			}
 +			err = io.ErrUnexpectedEOF
 +		}
 +	}()
 +	return c.Conn.Write(b)
 +}
 +
-+// Wrap ClientConn to manage heartbeat and underlying connection lifecycle
-+type wrappedClientConn struct {
-+	*ClientConn
-+	stopHeartbeat func()
-+	safeConn			*safeNetConn
-+}
-+
-+func (c *wrappedClientConn) Close() error {
++func (c *ClientConn) Close() error {
 +	if c.stopHeartbeat != nil {
 +		c.stopHeartbeat()
 +	}
 +	if c.safeConn != nil {
 +		c.safeConn.markClosed()
 +	}
-+	return c.ClientConn.Close()
++	return c.Conn.Close()
 +}
 +
 +// Keep-alive function essential for Android/mobile networks.
 +// It proactively closes the connection on failure to trigger reconnection logic.
-+func keepAlive(ctx context.Context, wsConn *websocket.Conn, logf func(string, ...any)) {
++func keepAlive(
++	ctx context.Context,
++	stopHeartbeat context.CancelFunc,
++	wsConn *websocket.Conn,
++	logf func(string, ...any),
++) {
++	// Initial random delay of 1–5 seconds to avoid ping failure immediately after dialing
++	delay := time.Duration(1+rand.Intn(5)) * time.Second
++	select {
++	case <-ctx.Done():
++		return
++	case <-time.After(delay):
++	}
++
 +	ticker := time.NewTicker(30 * time.Second)
 +	defer ticker.Stop()
 +
@@ -89,20 +105,16 @@ index 06a2131fd..4d1d0c261 100644
 +			}
 +			return
 +		case <-ticker.C:
-+			// Use a shorter timeout for the Ping operation itself to detect "half-open" connections.
 +			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 +			err := wsConn.Ping(pingCtx)
 +			cancel()
 +
 +			if err != nil {
 +				if logf != nil {
-+					logf("[v2] controlhttp: websocket keepalive ping failed: %v. Initiating active shutdown.", err)
++					logf("[v2] controlhttp: websocket keepalive ping failed: %v. Cancelling conn.", err)
 +				}
-+				// Active shutdown: this will cause any pending Read/Write calls in the 
-+				// transport layer to fail immediately with an error, allowing the 
-+				// high-level dialer to restart the connection process.
-+				wsConn.Close(websocket.StatusPolicyViolation, "keepalive failed")
-+				return // Terminate the goroutine after closing the connection.
++				stopHeartbeat()
++				return
 +			}
 +		}
 +	}
@@ -169,11 +181,11 @@ index 06a2131fd..4d1d0c261 100644
 +	}()
 +
 +	// Start heartbeat (attached to connCtx rather than the ephemeral dialing ctx)
-+	go keepAlive(connCtx, wsConn, a.logf)
++	go keepAlive(connCtx, stopHeartbeat, wsConn, a.logf)
 +
 +	// Adapt to net.Conn and add panic protection
-+	netConn := wsconn.NetConn(ctx, wsConn, websocket.MessageBinary, wsURL.String())
-+	safeConn := &safeNetConn{Conn: netConn}
++	netConn := wsconn.NetConn(connCtx, wsConn, websocket.MessageBinary, wsURL.String())
++	safeConn := &safeNetConn{Conn: netConn, logf: a.logf,}
 +
 +	// Complete Noise handshake
 +	cbConn, err := cont(ctx, safeConn)
@@ -184,8 +196,8 @@ index 06a2131fd..4d1d0c261 100644
 +	// Handshake successful, transfer ownership of resources.
 +	// connCtx and stopHeartbeat are now managed by the returned ClientConn.
 +	cleanup = false
-+	return &wrappedClientConn{
-+		ClientConn:    &ClientConn{Conn: cbConn},
++	return &ClientConn{
++		Conn:    cbConn,
 +		stopHeartbeat: stopHeartbeat, // Hand over heartbeat control
 +		safeConn:      safeConn,
 +	}, nil
@@ -194,7 +206,7 @@ index 06a2131fd..4d1d0c261 100644
  // Dial connects to the HTTP server at this Dialer's Host:HTTPPort, requests to
  // switch to the Tailscale control protocol, and returns an established control
  // protocol connection.
-@@ -237,6 +408,14 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+@@ -237,6 +418,14 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
  // If optAddr is valid, then no DNS is used and the connection will be made to the
  // provided address.
  func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
@@ -209,3 +221,14 @@ index 06a2131fd..4d1d0c261 100644
  	// Create one shared context used by both port 80 and port 443 dials.
  	// If port 80 is still in flight when 443 returns, this deferred cancel
  	// will stop the port 80 dial.
+diff --git a/control/controlhttp/client_common.go b/control/controlhttp/client_common.go
+index dd94e93cd..a255cf396 100644
+--- a/control/controlhttp/client_common.go
++++ b/control/controlhttp/client_common.go
+@@ -14,4 +14,6 @@
+ type ClientConn struct {
+ 	// Conn is the noise connection.
+ 	*controlbase.Conn
++	stopHeartbeat func()
++	safeConn    *safeNetConn
+ }
