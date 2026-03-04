@@ -1,0 +1,94 @@
+diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
+index 06a2131fd..5f5bc8836 100644
+--- a/control/controlhttp/client.go
++++ b/control/controlhttp/client.go
+@@ -36,6 +36,7 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/coder/websocket"
+ 	"tailscale.com/control/controlbase"
+ 	"tailscale.com/control/controlhttp/controlhttpcommon"
+ 	"tailscale.com/envknob"
+@@ -48,6 +49,7 @@
+ 	"tailscale.com/net/netx"
+ 	"tailscale.com/net/sockstats"
+ 	"tailscale.com/net/tlsdial"
++	"tailscale.com/net/wsconn"
+ 	"tailscale.com/syncs"
+ 	"tailscale.com/tailcfg"
+ 	"tailscale.com/tstime"
+@@ -55,6 +57,59 @@
+ 
+ var stdDialer net.Dialer
+ 
++// use WebSocket by default; set to "0" to fallback to HTTP/HTTPS
++var forceWebSocket = func() bool {return envknob.BoolDefaultTrue("TS_FORCE_CONTROL_WEBSOCKET")}
++
++func (a *Dialer) dialWebSocket(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
++	init, cont, err := controlbase.ClientDeferred(a.MachineKey, a.ControlKey, a.ProtocolVersion)
++	if err != nil {
++		return nil, err
++	}
++
++	wsScheme := "wss"
++	host := a.Hostname
++
++	if a.HTTPSPort == "" {
++		wsScheme = "ws"
++		if a.HTTPPort != "" && a.HTTPPort != "80" {
++			host = net.JoinHostPort(host, a.HTTPPort)
++		}
++	} else if a.HTTPSPort != "443" {
++		host = net.JoinHostPort(host, a.HTTPSPort)
++	} else {
++		if a.HTTPPort != "" && a.HTTPPort != "80" {
++			wsScheme = "ws"
++			host = net.JoinHostPort(host, a.HTTPPort)
++		}
++	}
++
++	wsURL := &url.URL{
++		Scheme: wsScheme,
++		Host:   host,
++		Path:   serverUpgradePath,
++		RawQuery: url.Values{
++			controlhttpcommon.HandshakeHeaderName: []string{base64.StdEncoding.EncodeToString(init)},
++		}.Encode(),
++	}
++
++	wsConn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
++		Subprotocols: []string{controlhttpcommon.UpgradeHeaderValue},
++	})
++	if err != nil {
++		return nil, err
++	}
++	longCtx := context.Background()
++	netConn := wsconn.NetConn(longCtx, wsConn, websocket.MessageBinary, wsURL.String())
++
++	cbConn, err := cont(longCtx, netConn)
++	if err != nil {
++		wsConn.Close(websocket.StatusInternalError, "noise handshake failed")
++		return nil, err
++	}
++
++	return &ClientConn{Conn: cbConn}, nil
++}
++
+ // Dial connects to the HTTP server at this Dialer's Host:HTTPPort, requests to
+ // switch to the Tailscale control protocol, and returns an established control
+ // protocol connection.
+@@ -237,6 +292,13 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+ // If optAddr is valid, then no DNS is used and the connection will be made to the
+ // provided address.
+ func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
++	if forceWebSocket() {
++		cc, err := a.dialWebSocket(ctx, optAddr, optACEHost)
++		if err != nil {
++			return nil, fmt.Errorf("WebSocket dial failed: %w", err)
++		}
++		return cc, nil
++	}
+ 	// Create one shared context used by both port 80 and port 443 dials.
+ 	// If port 80 is still in flight when 443 returns, this deferred cancel
+ 	// will stop the port 80 dial.
