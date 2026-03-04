@@ -1,5 +1,5 @@
 diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
-index 06a2131fd..e9fe30b96 100644
+index 06a2131fd..4d1d0c261 100644
 --- a/control/controlhttp/client.go
 +++ b/control/controlhttp/client.go
 @@ -36,6 +36,7 @@
@@ -18,42 +18,124 @@ index 06a2131fd..e9fe30b96 100644
  	"tailscale.com/syncs"
  	"tailscale.com/tailcfg"
  	"tailscale.com/tstime"
-@@ -94,6 +96,7 @@ func (a *Dialer) httpsFallbackDelay() time.Duration {
- }
+@@ -55,6 +57,175 @@
  
- var _ = envknob.RegisterBool("TS_USE_CONTROL_DIAL_PLAN") // to record at init time whether it's in use
+ var stdDialer net.Dialer
+ 
 +var forceWebSocket = func() bool {return envknob.BoolDefaultTrue("TS_FORCE_CONTROL_WEBSOCKET")} // use WebSocket by default; set to "0" to fallback to HTTP/HTTPS
- 
- func (a *Dialer) dial(ctx context.Context) (*ClientConn, error) {
- 
-@@ -237,6 +240,9 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
- // If optAddr is valid, then no DNS is used and the connection will be made to the
- // provided address.
- func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
-+	if forceWebSocket() {
-+		return a.dialWebSocket(ctx, optAddr, optACEHost)
++
++// Safe connection wrapper to prevent panic during underlying read/write operations
++type safeNetConn struct {
++	net.Conn
++	closed atomic.Bool
++}
++
++func (c *safeNetConn) markClosed() {
++	c.closed.Store(true)
++}
++
++func (c *safeNetConn) Read(b []byte) (n int, err error) {
++	if c.closed.Load() {
++		return 0, io.ErrClosedPipe
 +	}
- 	// Create one shared context used by both port 80 and port 443 dials.
- 	// If port 80 is still in flight when 443 returns, this deferred cancel
- 	// will stop the port 80 dial.
-@@ -576,3 +582,44 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
- 
- 	return netutil.NewAltReadWriteCloserConn(rwc, switchedConn), nil
- }
++	defer func() {
++		if r := recover(); r != nil {
++			err = io.ErrUnexpectedEOF
++		}
++	}()
++	return c.Conn.Read(b)
++}
++
++func (c *safeNetConn) Write(b []byte) (n int, err error) {
++	if c.closed.Load() {
++		return 0, io.ErrClosedPipe
++	}
++	defer func() {
++		if r := recover(); r != nil {
++			err = io.ErrUnexpectedEOF
++		}
++	}()
++	return c.Conn.Write(b)
++}
++
++// Wrap ClientConn to manage heartbeat and underlying connection lifecycle
++type wrappedClientConn struct {
++	*ClientConn
++	stopHeartbeat func()
++	safeConn			*safeNetConn
++}
++
++func (c *wrappedClientConn) Close() error {
++	if c.stopHeartbeat != nil {
++		c.stopHeartbeat()
++	}
++	if c.safeConn != nil {
++		c.safeConn.markClosed()
++	}
++	return c.ClientConn.Close()
++}
++
++// Keep-alive function essential for Android/mobile networks.
++// It proactively closes the connection on failure to trigger reconnection logic.
++func keepAlive(ctx context.Context, wsConn *websocket.Conn, logf func(string, ...any)) {
++	ticker := time.NewTicker(30 * time.Second)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			if logf != nil {
++				logf("[v2] controlhttp: websocket keepalive stopped: %v", ctx.Err())
++			}
++			return
++		case <-ticker.C:
++			// Use a shorter timeout for the Ping operation itself to detect "half-open" connections.
++			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++			err := wsConn.Ping(pingCtx)
++			cancel()
++
++			if err != nil {
++				if logf != nil {
++					logf("[v2] controlhttp: websocket keepalive ping failed: %v. Initiating active shutdown.", err)
++				}
++				// Active shutdown: this will cause any pending Read/Write calls in the 
++				// transport layer to fail immediately with an error, allowing the 
++				// high-level dialer to restart the connection process.
++				wsConn.Close(websocket.StatusPolicyViolation, "keepalive failed")
++				return // Terminate the goroutine after closing the connection.
++			}
++		}
++	}
++}
 +
 +func (a *Dialer) dialWebSocket(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
++	// Generate handshake data
 +	init, cont, err := controlbase.ClientDeferred(a.MachineKey, a.ControlKey, a.ProtocolVersion)
 +	if err != nil {
 +		return nil, err
 +	}
 +
++	// Build WebSocket URL
 +	wsScheme := "wss"
 +	host := a.Hostname
-+	if a.HTTPPort != "" && a.HTTPPort != "80" && a.HTTPSPort == "443" {
++
++	if a.HTTPSPort == "" {
++		// Case 1: HTTPS explicitly disabled → fallback to HTTP/ws
 +		wsScheme = "ws"
-+		host = net.JoinHostPort(host, a.HTTPPort)
-+	} else if a.HTTPSPort != "" && a.HTTPSPort != "443" {
++		if a.HTTPPort != "" && a.HTTPPort != "80" {
++			host = net.JoinHostPort(host, a.HTTPPort)
++		}
++	} else if a.HTTPSPort != "443" {
++		// Case 2: HTTPS enabled but non-standard port → keep wss
 +		host = net.JoinHostPort(host, a.HTTPSPort)
++		// wsScheme stays "wss"
++	} else {
++		// Case 3: HTTPS enabled on standard port 443
++		// Only downgrade to ws if HTTPPort is explicitly non-standard
++		if a.HTTPPort != "" && a.HTTPPort != "80" {
++			wsScheme = "ws"
++			host = net.JoinHostPort(host, a.HTTPPort)
++		}
 +	}
 +
 +	wsURL := &url.URL{
@@ -65,6 +147,7 @@ index 06a2131fd..e9fe30b96 100644
 +		}.Encode(),
 +	}
 +
++	// Establish WebSocket connection
 +	wsConn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
 +		Subprotocols: []string{controlhttpcommon.UpgradeHeaderValue},
 +	})
@@ -72,13 +155,57 @@ index 06a2131fd..e9fe30b96 100644
 +		return nil, err
 +	}
 +
-+	netConn := wsconn.NetConn(context.Background(), wsConn, websocket.MessageBinary, wsURL.String())
++	// Create a context independent of the dialing ctx, but controlled by the 
++	// Close method of the connection object to manage the heartbeat lifecycle.
++	connCtx, stopHeartbeat := context.WithCancel(context.Background())
++	cleanup := true
++	defer func() {
++		if cleanup {
++			// Stop the heartbeat and close the connection only if handshake 
++			// fails and manual cleanup is required.
++			stopHeartbeat() 
++			_ = wsConn.Close(websocket.StatusInternalError, "setup failed")
++		}
++	}()
 +
-+	cbConn, err := cont(ctx, netConn)
++	// Start heartbeat (attached to connCtx rather than the ephemeral dialing ctx)
++	go keepAlive(connCtx, wsConn, a.logf)
++
++	// Adapt to net.Conn and add panic protection
++	netConn := wsconn.NetConn(ctx, wsConn, websocket.MessageBinary, wsURL.String())
++	safeConn := &safeNetConn{Conn: netConn}
++
++	// Complete Noise handshake
++	cbConn, err := cont(ctx, safeConn)
 +	if err != nil {
-+		netConn.Close()
-+		return nil, err
++		return nil, err // Triggers defer cleanup
 +	}
-+	return &ClientConn{Conn: cbConn}, nil
++
++	// Handshake successful, transfer ownership of resources.
++	// connCtx and stopHeartbeat are now managed by the returned ClientConn.
++	cleanup = false
++	return &wrappedClientConn{
++		ClientConn:    &ClientConn{Conn: cbConn},
++		stopHeartbeat: stopHeartbeat, // Hand over heartbeat control
++		safeConn:      safeConn,
++	}, nil
 +}
-\ No newline at end of file
++
+ // Dial connects to the HTTP server at this Dialer's Host:HTTPPort, requests to
+ // switch to the Tailscale control protocol, and returns an established control
+ // protocol connection.
+@@ -237,6 +408,14 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+ // If optAddr is valid, then no DNS is used and the connection will be made to the
+ // provided address.
+ func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
++	//fallback to normal TCP dial if WebSocket not forced or failed
++	if forceWebSocket() {
++		if cc, err := a.dialWebSocket(ctx, optAddr, optACEHost); err == nil {
++			return cc, nil
++		} else {
++			a.logf("[v2] WS dial failed: %v, fallback to TCP", err)
++		}
++	}
+ 	// Create one shared context used by both port 80 and port 443 dials.
+ 	// If port 80 is still in flight when 443 returns, this deferred cancel
+ 	// will stop the port 80 dial.
