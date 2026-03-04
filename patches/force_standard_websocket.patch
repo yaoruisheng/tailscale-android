@@ -1,5 +1,5 @@
 diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
-index 06a2131fd..dc89d7e1a 100644
+index 06a2131fd..e9fe30b96 100644
 --- a/control/controlhttp/client.go
 +++ b/control/controlhttp/client.go
 @@ -36,6 +36,7 @@
@@ -10,92 +10,52 @@ index 06a2131fd..dc89d7e1a 100644
  	"tailscale.com/control/controlbase"
  	"tailscale.com/control/controlhttp/controlhttpcommon"
  	"tailscale.com/envknob"
-@@ -46,8 +47,8 @@
- 	"tailscale.com/net/dnsfallback"
- 	"tailscale.com/net/netutil"
+@@ -48,6 +49,7 @@
  	"tailscale.com/net/netx"
--	"tailscale.com/net/sockstats"
+ 	"tailscale.com/net/sockstats"
  	"tailscale.com/net/tlsdial"
 +	"tailscale.com/net/wsconn"
  	"tailscale.com/syncs"
  	"tailscale.com/tailcfg"
  	"tailscale.com/tstime"
-@@ -237,106 +238,57 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+@@ -94,6 +96,7 @@ func (a *Dialer) httpsFallbackDelay() time.Duration {
+ }
+ 
+ var _ = envknob.RegisterBool("TS_USE_CONTROL_DIAL_PLAN") // to record at init time whether it's in use
++var forceWebSocket = func() bool {return envknob.BoolDefaultTrue("TS_FORCE_CONTROL_WEBSOCKET")} // use WebSocket by default; set to "0" to fallback to HTTP/HTTPS
+ 
+ func (a *Dialer) dial(ctx context.Context) (*ClientConn, error) {
+ 
+@@ -237,6 +240,9 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
  // If optAddr is valid, then no DNS is used and the connection will be made to the
  // provided address.
  func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
--	// Create one shared context used by both port 80 and port 443 dials.
--	// If port 80 is still in flight when 443 returns, this deferred cancel
--	// will stop the port 80 dial.
--	ctx, cancel := context.WithCancel(ctx)
--	defer cancel()
--
--	ctx = sockstats.WithSockStats(ctx, sockstats.LabelControlClientDialer, a.logf)
-+	// 强制使用标准 WebSocket 协议，跳过所有 HTTP/HTTPS 升级尝试
-+	a.logf("[v1] controlhttp: forcing WebSocket connection to %s", a.Hostname)
++	if forceWebSocket() {
++		return a.dialWebSocket(ctx, optAddr, optACEHost)
++	}
+ 	// Create one shared context used by both port 80 and port 443 dials.
+ 	// If port 80 is still in flight when 443 returns, this deferred cancel
+ 	// will stop the port 80 dial.
+@@ -576,3 +582,44 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
  
--	// u80 and u443 are the URLs we'll try to hit over HTTP or HTTPS,
--	// respectively, in order to do the HTTP upgrade to a net.Conn over which
--	// we'll speak Noise.
--	u80 := &url.URL{
--		Scheme: "http",
--		Host:   net.JoinHostPort(a.Hostname, strDef(a.HTTPPort, "80")),
--		Path:   serverUpgradePath,
--	}
--	u443 := &url.URL{
--		Scheme: "https",
--		Host:   net.JoinHostPort(a.Hostname, strDef(a.HTTPSPort, "443")),
--		Path:   serverUpgradePath,
--	}
--	if a.HTTPSPort == NoPort || optACEHost != "" {
--		u443 = nil
-+	// 1. 初始化 Noise 协议握手
+ 	return netutil.NewAltReadWriteCloserConn(rwc, switchedConn), nil
+ }
++
++func (a *Dialer) dialWebSocket(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
 +	init, cont, err := controlbase.ClientDeferred(a.MachineKey, a.ControlKey, a.ProtocolVersion)
 +	if err != nil {
 +		return nil, err
- 	}
- 
--	type tryURLRes struct {
--		u    *url.URL    // input (the URL conn+err are for/from)
--		conn *ClientConn // result (mutually exclusive with err)
--		err  error
--	}
--	ch := make(chan tryURLRes) // must be unbuffered
--	try := func(u *url.URL) {
--		if debugNoiseDial() {
--			a.logf("trying noise dial (%v, %v) ...", u, cmp.Or(optACEHost, optAddr.String()))
--		}
--		cbConn, err := a.dialURL(ctx, u, optAddr, optACEHost)
--		if debugNoiseDial() {
--			a.logf("noise dial (%v, %v) = (%v, %v)", u, cmp.Or(optACEHost, optAddr.String()), cbConn, err)
--		}
--		select {
--		case ch <- tryURLRes{u, cbConn, err}:
--		case <-ctx.Done():
--			if cbConn != nil {
--				cbConn.Close()
--			}
-+	// 2. 构建 WebSocket URL (逻辑移植自 client_js.go)
++	}
++
 +	wsScheme := "wss"
 +	host := a.Hostname
-+	// 端口选择逻辑：如果配置了非标准HTTP端口且HTTPS端口是标准443，则使用ws协议
 +	if a.HTTPPort != "" && a.HTTPPort != "80" && a.HTTPSPort == "443" {
 +		wsScheme = "ws"
 +		host = net.JoinHostPort(host, a.HTTPPort)
-+	} else {
-+		// 默认使用HTTPS端口（或配置的HTTPS端口）
-+		port := strDef(a.HTTPSPort, "443")
-+		if port != "443" {
-+			host = net.JoinHostPort(host, port)
- 		}
- 	}
--
--	forceTLS := a.forceNoise443()
--
--	// Start the plaintext HTTP attempt first, unless disabled by the envknob.
--	if !forceTLS || u443 == nil {
--		go try(u80)
-+	
++	} else if a.HTTPSPort != "" && a.HTTPSPort != "443" {
++		host = net.JoinHostPort(host, a.HTTPSPort)
++	}
++
 +	wsURL := &url.URL{
 +		Scheme: wsScheme,
 +		Host:   host,
@@ -103,68 +63,22 @@ index 06a2131fd..dc89d7e1a 100644
 +		RawQuery: url.Values{
 +			controlhttpcommon.HandshakeHeaderName: []string{base64.StdEncoding.EncodeToString(init)},
 +		}.Encode(),
- 	}
- 
--	// In case outbound port 80 blocked or MITM'ed poorly, start a backup timer
--	// to dial port 443 if port 80 doesn't either succeed or fail quickly.
--	var try443Timer tstime.TimerController
--	if u443 != nil {
--		delay := a.httpsFallbackDelay()
--		if forceTLS {
--			delay = 0
--		}
--		try443Timer = a.clock().AfterFunc(delay, func() { try(u443) })
--		defer try443Timer.Stop()
-+	// 3. 建立 WebSocket 连接
++	}
++
 +	wsConn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
 +		Subprotocols: []string{controlhttpcommon.UpgradeHeaderValue},
 +	})
 +	if err != nil {
-+		return nil, fmt.Errorf("websocket dial failed: %w", err)
- 	}
- 
--	var err80, err443 error
--	if forceTLS {
--		err80 = errors.New("TLS forced: no port 80 dialed")
--	}
--	for {
--		select {
--		case <-ctx.Done():
--			return nil, fmt.Errorf("connection attempts aborted by context: %w", ctx.Err())
--		case res := <-ch:
--			if res.err == nil {
--				return res.conn, nil
--			}
--			switch res.u {
--			case u80:
--				// Connecting over plain HTTP failed; assume it's an HTTP proxy
--				// being difficult and see if we can get through over HTTPS.
--				err80 = res.err
--				// Stop the fallback timer and run it immediately. We don't use
--				// Timer.Reset(0) here because on AfterFuncs, that can run it
--				// again.
--				if try443Timer != nil && try443Timer.Stop() {
--					go try(u443)
--				} // else we lost the race and it started already which is what we want
--			case u443:
--				err443 = res.err
--			default:
--				panic("invalid")
--			}
--			if err80 != nil && err443 != nil {
--				return nil, fmt.Errorf("all connection attempts failed (HTTP: %v, HTTPS: %v)", err80, err443)
--			}
--		}
-+	// 4. 将 WebSocket 连接适配为 net.Conn
++		return nil, err
++	}
++
 +	netConn := wsconn.NetConn(context.Background(), wsConn, websocket.MessageBinary, wsURL.String())
-+	
-+	// 5. 完成 Noise 协议握手
++
 +	cbConn, err := cont(ctx, netConn)
 +	if err != nil {
 +		netConn.Close()
-+		return nil, fmt.Errorf("noise handshake over websocket failed: %w", err)
- 	}
++		return nil, err
++	}
 +	return &ClientConn{Conn: cbConn}, nil
- }
- 
- // dialURL attempts to connect to the given URL.
++}
+\ No newline at end of file
