@@ -59,8 +59,9 @@ jobs:
             ~/Android/Sdk
           key: ${{ runner.os }}-android-sdk-ndk-${{ github.event.inputs.android_ref }}
 
-      - name: Apply Patch & Replace Logic
+      - name: Apply Patch
         run: |
+          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/tailscale-android.patch
           cd tailscale-core
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
           cd ..
@@ -71,36 +72,13 @@ jobs:
         run: |
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > tailscale.jks
 
-      - name: Full Build & apksigner
+      - name: Build with Make
         env:
           JKS_PATH: ${{ github.workspace }}/tailscale.jks
           JKS_PASSWORD: ${{ secrets.JKS_PASSWORD }}
         run: |
           make androidsdk
-          make version gradle-dependencies build-unstripped-aar
-          
-          cd android
-          ./gradlew assembleRelease
-          
-          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name zipalign | sort -V | tail -n 1)
-          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
-
-          find build/outputs/apk/release/ -name "*unsigned.apk" | while read unsigned_apk; do
-            aligned_apk=$(echo "$unsigned_apk" | sed 's/-unsigned/-aligned/')
-            final_apk=$(echo "$unsigned_apk" | sed 's/-unsigned//')
-            
-            $ZIPALIGN -v 4 "$unsigned_apk" "$aligned_apk"
-            
-            $APKSIGNER sign --ks ../tailscale.jks \
-              --ks-pass "pass:${JKS_PASSWORD}" \
-              --ks-key-alias tailscale \
-              --key-pass "pass:${JKS_PASSWORD}" \
-              --out "$final_apk" \
-              "$aligned_apk"
-            
-            $APKSIGNER verify -v "$final_apk"
-            rm "$unsigned_apk" "$aligned_apk"
-          done
+          make release-apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -108,8 +86,8 @@ jobs:
           tag_name: ${{ github.event.inputs.android_ref }}-${{ github.run_number }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
-            已修复干扰字符并使用 apksigner 签名。
+            强制使用websocket的tailscale android客户端。
           files: |
-            android/build/outputs/apk/release/*.apk
+            tailscale-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
