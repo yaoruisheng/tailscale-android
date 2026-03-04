@@ -61,7 +61,7 @@ jobs:
 
       - name: Apply Patch
         run: |
-          patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/tailscale-android.patch
+          patch -p1 --verbose --ignore-whitespace < ./my-assets/patches/tailscale-android.patch
           cd tailscale-core
           patch -p1 --verbose --ignore-whitespace < ../my-assets/patches/force_standard_websocket.patch
           cd ..
