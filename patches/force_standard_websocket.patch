@@ -1,5 +1,5 @@
 diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
-index 06a2131fd..5f5bc8836 100644
+index e81209174..562e0a27f 100644
 --- a/control/controlhttp/client.go
 +++ b/control/controlhttp/client.go
 @@ -36,6 +36,7 @@
@@ -18,7 +18,7 @@ index 06a2131fd..5f5bc8836 100644
  	"tailscale.com/syncs"
  	"tailscale.com/tailcfg"
  	"tailscale.com/tstime"
-@@ -55,6 +57,59 @@
+@@ -55,6 +57,70 @@
  
  var stdDialer net.Dialer
  
@@ -57,18 +57,29 @@ index 06a2131fd..5f5bc8836 100644
 +		}.Encode(),
 +	}
 +
-+	wsConn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
++	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
++	defer dialCancel()
++
++	wsConn, _, err := websocket.Dial(dialCtx, wsURL.String(), &websocket.DialOptions{
 +		Subprotocols: []string{controlhttpcommon.UpgradeHeaderValue},
 +	})
 +	if err != nil {
 +		return nil, err
 +	}
-+	longCtx := context.Background()
-+	netConn := wsconn.NetConn(longCtx, wsConn, websocket.MessageBinary, wsURL.String())
 +
-+	cbConn, err := cont(longCtx, netConn)
++	raw := wsconn.NetConn(context.Background(), wsConn, websocket.MessageBinary, wsURL.String())
++
++	handshakeCtx, handshakeCancel := context.WithTimeout(dialCtx, 15*time.Second)
++	defer handshakeCancel()
++
++	if deadline, ok := handshakeCtx.Deadline(); ok {
++		raw.SetDeadline(deadline)
++		defer raw.SetDeadline(time.Time{})
++	}
++
++	cbConn, err := cont(handshakeCtx, raw)
 +	if err != nil {
-+		wsConn.Close(websocket.StatusInternalError, "noise handshake failed")
++		wsConn.Close(websocket.StatusPolicyViolation, "noise handshake failed")
 +		return nil, err
 +	}
 +
@@ -78,7 +89,7 @@ index 06a2131fd..5f5bc8836 100644
  // Dial connects to the HTTP server at this Dialer's Host:HTTPPort, requests to
  // switch to the Tailscale control protocol, and returns an established control
  // protocol connection.
-@@ -237,6 +292,13 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+@@ -237,6 +303,13 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
  // If optAddr is valid, then no DNS is used and the connection will be made to the
  // provided address.
  func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
