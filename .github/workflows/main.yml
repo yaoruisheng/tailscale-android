@@ -83,7 +83,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.android_ref }}-${{ github.run_number }}
+          tag_name: ${{ github.event.inputs.android_ref }}
           name: Tailscale Android ${{ github.event.inputs.android_ref }}
           body: |
             强制使用websocket的tailscale android客户端。
