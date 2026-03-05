@@ -1,5 +1,5 @@
 diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
-index 06a2131fd..5f5bc8836 100644
+index 06a2131fd..547e6b5c5 100644
 --- a/control/controlhttp/client.go
 +++ b/control/controlhttp/client.go
 @@ -36,6 +36,7 @@
@@ -18,7 +18,7 @@ index 06a2131fd..5f5bc8836 100644
  	"tailscale.com/syncs"
  	"tailscale.com/tailcfg"
  	"tailscale.com/tstime"
-@@ -55,6 +57,59 @@
+@@ -55,6 +57,58 @@
  
  var stdDialer net.Dialer
  
@@ -63,10 +63,9 @@ index 06a2131fd..5f5bc8836 100644
 +	if err != nil {
 +		return nil, err
 +	}
-+	longCtx := context.Background()
-+	netConn := wsconn.NetConn(longCtx, wsConn, websocket.MessageBinary, wsURL.String())
++	netConn := wsconn.NetConn(context.Background(), wsConn, websocket.MessageBinary, wsURL.String())
 +
-+	cbConn, err := cont(longCtx, netConn)
++	cbConn, err := cont(ctx, netConn)
 +	if err != nil {
 +		wsConn.Close(websocket.StatusInternalError, "noise handshake failed")
 +		return nil, err
@@ -78,7 +77,7 @@ index 06a2131fd..5f5bc8836 100644
  // Dial connects to the HTTP server at this Dialer's Host:HTTPPort, requests to
  // switch to the Tailscale control protocol, and returns an established control
  // protocol connection.
-@@ -237,6 +292,13 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
+@@ -237,6 +291,13 @@ func (a *Dialer) dialHost(ctx context.Context) (*ClientConn, error) {
  // If optAddr is valid, then no DNS is used and the connection will be made to the
  // provided address.
  func (a *Dialer) dialHostOpt(ctx context.Context, optAddr netip.Addr, optACEHost string) (*ClientConn, error) {
